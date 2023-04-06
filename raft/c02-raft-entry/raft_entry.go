@@ -29,7 +29,7 @@ type AppendEntriesReply struct {
 	FirstIndex   int  //存储第一个冲突编号的日志索引
 }
 
-//唤醒一致性检查
+// 唤醒一致性检查
 func (rf *Raft) wakeupConsistencyCheck() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -38,7 +38,7 @@ func (rf *Raft) wakeupConsistencyCheck() {
 	}
 }
 
-//启动日志复制进程
+// 启动日志复制进程
 func (rf *Raft) logEntryAgreeDaemon() {
 	//遍历节点 向其他每个节点发起日志复制操作
 	for i := 0; i < len(rf.peers); i++ {
@@ -48,7 +48,7 @@ func (rf *Raft) logEntryAgreeDaemon() {
 	}
 }
 
-//发起日志复制操作
+// 发起日志复制操作
 func (rf *Raft) consistencyCheckDaemon(i int) {
 	for {
 		rf.mu.Lock()
@@ -86,7 +86,6 @@ func (rf *Raft) consistencyCheckDaemon(i int) {
 				//发起日志复制请求
 				if rf.sendAppendEntries(i, &args, &reply) {
 					replyCh <- reply
-
 				}
 			}()
 
@@ -98,21 +97,65 @@ func (rf *Raft) consistencyCheckDaemon(i int) {
 					//说明响应成功
 					rf.matchIndex[i] = len(rf.Logs) - 1
 					rf.nextIndex[i] = len(rf.Logs)
+					//提交日志(更新已提交的日志索引)
+					rf.updateCommitIndex()
+				} else {
+					//响应失败
+					//判断响应传回来的term与当前节点(leader)谁大
+					//若当前节点的term更大
+					if reply.CurrentTerm > args.Term {
+						rf.VotedFor = -1
+						//将自己的任期号改为当前reply的任期号
+						rf.CurrentTerm = reply.CurrentTerm
+					}
+					//不能再担任leader,转变为follower
+					if rf.isLeader {
+						rf.isLeader = false
+						//一致性检查
+						rf.wakeupConsistencyCheck()
+					}
+					rf.mu.Unlock()
+					rf.resetTimer <- struct{}{}
+					return
 				}
-				//提交日志(更新已提交的日志索引)
-				rf.updateCommitIndex()
+				//解决日志冲突
+				//know:当前leader能否找到冲突
+				//lastIndex代表当前节点中最后一个包含冲突任期号的日志索引
+				var know, lastIndex = false, 0
+				if reply.ConflictTerm != 0 {
+					//找到最后的产生冲突的任期编号
+					for i := len(rf.Logs) - 1; i > 0; i-- {
+						//找到冲突编号
+						if rf.Logs[i].Term == reply.ConflictTerm {
+							know = true
+							lastIndex = i
+							break
+						}
+					}
+					//如果找到冲突编号
+					if know {
+						//判断当前获取的冲突编号索引与想应中的冲突索引的大小
+						if lastIndex > reply.FirstIndex {
+							//说明在最后一个产生冲突的日志之前已经有一个冲突，我们只需要保存索引值最小的那个冲突的索引
+							lastIndex = reply.FirstIndex
+						}
+						rf.nextIndex[i] = lastIndex
+					} else {
+						rf.nextIndex[i] = reply.FirstIndex
+					}
+				}
 			}
 		}
 	}
 }
 
-//发起日志复制的请求
+// 发起日志复制的请求
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
-//更新日志提交索引
+// 更新日志提交索引
 func (rf *Raft) updateCommitIndex() {
 
 }
