@@ -89,6 +89,19 @@ func (rf *Raft) consistencyCheckDaemon(i int) {
 
 				}
 			}()
+
+			//获取响应
+			select {
+			case reply := <-replyCh:
+				rf.mu.Lock()
+				if reply.Success {
+					//说明响应成功
+					rf.matchIndex[i] = len(rf.Logs) - 1
+					rf.nextIndex[i] = len(rf.Logs)
+				}
+				//提交日志(更新已提交的日志索引)
+				rf.updateCommitIndex()
+			}
 		}
 	}
 }
@@ -97,4 +110,9 @@ func (rf *Raft) consistencyCheckDaemon(i int) {
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+//更新日志提交索引
+func (rf *Raft) updateCommitIndex() {
+
 }
