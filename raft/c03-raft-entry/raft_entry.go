@@ -43,6 +43,48 @@ type AppendEntriesReply struct {
 	FirstIndex   int  //存储第一个冲突编号的日志索引
 }
 
+// 应用日志进程
+func (rf *Raft) applyEntryDaemon() {
+	//日志提交完成之后
+	//将日志进行应用、返回
+	for {
+		var logs []LogEntry
+		rf.mu.Lock()
+		//判断，如果节点最后的日志索引和已提交的日志索引相等
+		//说明提交过的所有日志都已经被应用
+		for rf.lastApplied == rf.commitIndex {
+			rf.commitCond.Wait()
+			select {
+			//若发生终端
+			case <-rf.shutdown:
+				rf.mu.Unlock()
+				close(rf.applyCh)
+				return
+			default:
+			}
+		}
+		//获取最后应用的日志索引与最新提交的日志索引
+		last, cur := rf.lastApplied, rf.commitIndex
+		//说明当前存在已提交但未应用到状态机的日志
+		if last < cur {
+			rf.lastApplied = rf.commitIndex
+			//截取已提交但未应用到状态机的这部分日志
+			logs := make([]LogEntry, cur-last)
+			copy(logs, rf.Logs[last+1:cur])
+		}
+		rf.mu.Unlock()
+		//对还没有被应用的日志进行应用
+		for i := 0; i < cur-last; i++ {
+			reply := ApplyMsg{
+				Index:   last + i + 1,
+				Command: logs[i].Command,
+			}
+			//传回响应
+			rf.applyCh <- reply
+		}
+	}
+}
+
 // 唤醒一致性检查
 func (rf *Raft) wakeupConsistencyCheck() {
 	for i := 0; i < len(rf.peers); i++ {
@@ -182,4 +224,84 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // 更新日志提交索引
 func (rf *Raft) updateCommitIndex() {
 
+}
+
+// AppendEntries 接收到日志复制请求之后的处理
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	select {
+	case <-rf.shutdown:
+		return
+	default:
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//判断任期,将比leader更新的任期填充到响应中
+	if args.Term < rf.CurrentTerm {
+		reply.CurrentTerm = rf.CurrentTerm
+		reply.Success = false
+		return
+	}
+	//如果当前角色还是leader则更改节点角色（强一致性）
+	if rf.isLeader {
+		rf.isLeader = false
+		rf.wakeupConsistencyCheck()
+	}
+	//如果不相等，那么在出现client直接访问当前follower的时候
+	//follower会重定向到一个错误的节点
+	if rf.VotedFor != args.LeaderId {
+		rf.VotedFor = args.LeaderId
+	}
+	//当前节点任期编号小于leader，则覆盖
+	if rf.CurrentTerm < args.Term {
+		rf.CurrentTerm = args.Term
+	}
+	//重置
+	rf.resetTimer <- struct{}{}
+	preLogIdx, preLogTerm := 0, 0
+	//大于说明在follower的日志中能够找到args包含的prevLogIndex
+	if len(rf.Logs) > args.PrevLogIndex {
+		preLogIdx = args.PrevLogIndex
+		//从follower节点的日志中获取到的与args传入的索引相同的任期编号
+		preLogTerm = rf.Logs[preLogIdx].Term
+	}
+
+	//判断是否匹配
+	if preLogIdx == args.PrevLogIndex && preLogTerm == args.PrevLogTerm {
+		reply.Success = true
+		//截取当前已知的最后一个匹配将不匹配的丢掉
+		rf.Logs = rf.Logs[:preLogIdx+1]
+		//追加日志
+		rf.Logs = append(rf.Logs, args.Entries...)
+		//获取更新之后的最后一个日志索引
+		last := len(rf.Logs) - 1
+		//更新commitIndex
+		//如果leaderCommit > commitIndex,令commitIndex等于leaderCommit和新日志条目索引值中较小的一个
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, last)
+			go func() { rf.commitCond.Broadcast() }()
+		}
+		//更新最后一个冲突日志
+		reply.ConflictTerm = rf.Logs[last].Term
+		reply.FirstIndex = last
+	} else {
+		reply.Success = false
+		//处理冲突任期编号
+		var first = 1
+		reply.ConflictTerm = preLogTerm
+		if reply.ConflictTerm == 0 {
+			first = len(rf.Logs)
+			//将响应的冲突条目设置为当前节点最后一个日志索引的条目
+			reply.ConflictTerm = rf.Logs[first-1].Term
+		} else {
+			//说明任期编号有冲突 preLogTerm!=args.PrevLogTerm
+			for i := preLogIdx - 1; i > 0; i-- {
+				if rf.Logs[i].Term != preLogTerm {
+					first = i + 1
+					break
+				}
+			}
+		}
+		//第一个产生冲突的日志
+		reply.FirstIndex = first
+	}
 }
